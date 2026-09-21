@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 from collections import Counter, defaultdict
+from collections.abc import Iterable, Iterator
 
 import regex
 
@@ -45,6 +47,147 @@ def _merge_pair(symbols: tuple[bytes, ...], pair: tuple[bytes, bytes]) -> tuple[
             index += 1
 
     return tuple(result)
+
+
+def _gpt2_byte_decoder() -> dict[str, int]:
+    """Return the inverse of GPT-2's printable byte-to-Unicode mapping."""
+    byte_values = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    code_points = byte_values.copy()
+    next_code_point_offset = 0
+    for byte_value in range(256):
+        if byte_value not in byte_values:
+            byte_values.append(byte_value)
+            code_points.append(256 + next_code_point_offset)
+            next_code_point_offset += 1
+    return {chr(code_point): byte_value for byte_value, code_point in zip(byte_values, code_points, strict=True)}
+
+
+class Tokenizer:
+    """A byte-level BPE tokenizer with optional indivisible special tokens."""
+
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ) -> None:
+        self.vocab = dict(vocab)
+        self.merges = list(merges)
+        self.special_tokens = list(special_tokens or [])
+
+        if any(token == "" for token in self.special_tokens):
+            raise ValueError("Special tokens must be non-empty strings")
+        if len(set(self.special_tokens)) != len(self.special_tokens):
+            raise ValueError("Special tokens must be unique")
+
+        token_to_id = {token_bytes: token_id for token_id, token_bytes in self.vocab.items()}
+        next_token_id = max(self.vocab, default=-1) + 1
+        for special_token in self.special_tokens:
+            token_bytes = special_token.encode("utf-8")
+            if token_bytes not in token_to_id:
+                self.vocab[next_token_id] = token_bytes
+                token_to_id[token_bytes] = next_token_id
+                next_token_id += 1
+
+        self.token_to_id = token_to_id
+        self.merge_ranks = {pair: rank for rank, pair in enumerate(self.merges)}
+        self.special_token_to_id = {
+            token: self.token_to_id[token.encode("utf-8")] for token in self.special_tokens
+        }
+
+        if self.special_tokens:
+            alternatives = "|".join(
+                regex.escape(token) for token in sorted(self.special_tokens, key=len, reverse=True)
+            )
+            self._special_token_pattern: regex.Pattern[str] | None = regex.compile(alternatives)
+        else:
+            self._special_token_pattern = None
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str | os.PathLike[str],
+        merges_filepath: str | os.PathLike[str],
+        special_tokens: list[str] | None = None,
+    ) -> Tokenizer:
+        """Load GPT-2-style JSON vocabulary and text merge files."""
+        byte_decoder = _gpt2_byte_decoder()
+
+        with open(vocab_filepath, encoding="utf-8") as vocab_file:
+            serialized_vocab: dict[str, int] = json.load(vocab_file)
+        vocab = {
+            token_id: bytes(byte_decoder[character] for character in serialized_token)
+            for serialized_token, token_id in serialized_vocab.items()
+        }
+
+        merges: list[tuple[bytes, bytes]] = []
+        with open(merges_filepath, encoding="utf-8") as merges_file:
+            for line in merges_file:
+                parts = line.rstrip().split(" ")
+                if len(parts) != 2:
+                    continue
+                left, right = parts
+                merges.append(
+                    (
+                        bytes(byte_decoder[character] for character in left),
+                        bytes(byte_decoder[character] for character in right),
+                    )
+                )
+
+        return cls(vocab, merges, special_tokens)
+
+    def _encode_pretoken(self, pretoken: str) -> Iterator[int]:
+        symbols = tuple(bytes([byte]) for byte in pretoken.encode("utf-8"))
+
+        while len(symbols) > 1:
+            best_pair: tuple[bytes, bytes] | None = None
+            best_rank = len(self.merge_ranks)
+            for pair in zip(symbols, symbols[1:]):
+                rank = self.merge_ranks.get(pair)
+                if rank is not None and rank < best_rank:
+                    best_pair = pair
+                    best_rank = rank
+
+            if best_pair is None:
+                break
+            symbols = _merge_pair(symbols, best_pair)
+
+        for symbol in symbols:
+            yield self.token_to_id[symbol]
+
+    def _encode_ordinary_text(self, text: str) -> Iterator[int]:
+        for match in PRETOKEN_PATTERN.finditer(text):
+            yield from self._encode_pretoken(match.group())
+
+    def _encode_text(self, text: str) -> Iterator[int]:
+        if self._special_token_pattern is None:
+            yield from self._encode_ordinary_text(text)
+            return
+
+        previous_end = 0
+        for match in self._special_token_pattern.finditer(text):
+            yield from self._encode_ordinary_text(text[previous_end : match.start()])
+            yield self.special_token_to_id[match.group()]
+            previous_end = match.end()
+        yield from self._encode_ordinary_text(text[previous_end:])
+
+    def encode(self, text: str) -> list[int]:
+        """Encode text into BPE token IDs."""
+        return list(self._encode_text(text))
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """Lazily encode strings from an iterable without collecting all IDs."""
+        for text in iterable:
+            yield from self._encode_text(text)
+
+    def decode(self, ids: list[int]) -> str:
+        """Decode token IDs, replacing any malformed UTF-8 byte sequences."""
+        token_bytes = b"".join(self.vocab[token_id] for token_id in ids)
+        return token_bytes.decode("utf-8", errors="replace")
 
 
 def train_bpe(
