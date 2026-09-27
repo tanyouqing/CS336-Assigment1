@@ -8,9 +8,7 @@ from collections.abc import Iterable, Iterator
 import regex
 
 
-PRETOKEN_PATTERN = regex.compile(
-    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-)
+PRETOKEN_PATTERN = regex.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
 
 def _count_pretokens(text: str, special_tokens: list[str]) -> Counter[tuple[bytes, ...]]:
@@ -52,9 +50,7 @@ def _merge_pair(symbols: tuple[bytes, ...], pair: tuple[bytes, bytes]) -> tuple[
 def _gpt2_byte_decoder() -> dict[str, int]:
     """Return the inverse of GPT-2's printable byte-to-Unicode mapping."""
     byte_values = (
-        list(range(ord("!"), ord("~") + 1))
-        + list(range(ord("¡"), ord("¬") + 1))
-        + list(range(ord("®"), ord("ÿ") + 1))
+        list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
     )
     code_points = byte_values.copy()
     next_code_point_offset = 0
@@ -95,14 +91,10 @@ class Tokenizer:
 
         self.token_to_id = token_to_id
         self.merge_ranks = {pair: rank for rank, pair in enumerate(self.merges)}
-        self.special_token_to_id = {
-            token: self.token_to_id[token.encode("utf-8")] for token in self.special_tokens
-        }
+        self.special_token_to_id = {token: self.token_to_id[token.encode("utf-8")] for token in self.special_tokens}
 
         if self.special_tokens:
-            alternatives = "|".join(
-                regex.escape(token) for token in sorted(self.special_tokens, key=len, reverse=True)
-            )
+            alternatives = "|".join(regex.escape(token) for token in sorted(self.special_tokens, key=len, reverse=True))
             self._special_token_pattern: regex.Pattern[str] | None = regex.compile(alternatives)
         else:
             self._special_token_pattern = None
@@ -139,6 +131,27 @@ class Tokenizer:
                 )
 
         return cls(vocab, merges, special_tokens)
+
+    def to_files(
+        self,
+        vocab_filepath: str | os.PathLike[str],
+        merges_filepath: str | os.PathLike[str],
+    ) -> None:
+        """Serialize vocabulary and merges using GPT-2's printable byte format."""
+        byte_encoder = {byte_value: character for character, byte_value in _gpt2_byte_decoder().items()}
+        serialized_vocab = {
+            "".join(byte_encoder[byte] for byte in token_bytes): token_id
+            for token_id, token_bytes in self.vocab.items()
+        }
+        with open(vocab_filepath, "w", encoding="utf-8") as vocab_file:
+            json.dump(serialized_vocab, vocab_file, ensure_ascii=False)
+            vocab_file.write("\n")
+
+        with open(merges_filepath, "w", encoding="utf-8") as merges_file:
+            for left, right in self.merges:
+                serialized_left = "".join(byte_encoder[byte] for byte in left)
+                serialized_right = "".join(byte_encoder[byte] for byte in right)
+                merges_file.write(f"{serialized_left} {serialized_right}\n")
 
     def _encode_pretoken(self, pretoken: str) -> Iterator[int]:
         symbols = tuple(bytes([byte]) for byte in pretoken.encode("utf-8"))
